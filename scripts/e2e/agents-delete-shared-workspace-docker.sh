@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
+# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
+if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+  exec /bin/bash "$0" "$@"
+fi
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SOURCE_ROOT="${OPENCLAW_DOCKER_E2E_REPO_ROOT:-$ROOT_DIR}"
 source "$ROOT_DIR/scripts/lib/docker-e2e-image.sh"
 
 IMAGE_NAME="$(docker_e2e_resolve_image "openclaw-agents-delete-shared-workspace-e2e:local" OPENCLAW_AGENTS_DELETE_SHARED_WORKSPACE_E2E_IMAGE)"
 SKIP_BUILD="${OPENCLAW_AGENTS_DELETE_SHARED_WORKSPACE_E2E_SKIP_BUILD:-0}"
 DOCKER_COMMAND_TIMEOUT="${OPENCLAW_AGENTS_DELETE_SHARED_WORKSPACE_DOCKER_COMMAND_TIMEOUT:-300s}"
+OPENCLAW_TEST_STATE_SCRIPT_B64="$(docker_e2e_test_state_shell_b64 agents-delete-shared-workspace empty)"
 
-docker_cmd() {
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$DOCKER_COMMAND_TIMEOUT" "$@"
-    return
-  fi
-  "$@"
-}
+docker_e2e_build_or_reuse "$IMAGE_NAME" agents-delete-shared-workspace "$SOURCE_ROOT/Dockerfile" "$SOURCE_ROOT" "" "$SKIP_BUILD"
+docker_e2e_harness_mount_args
 
-docker_e2e_build_or_reuse "$IMAGE_NAME" agents-delete-shared-workspace "$ROOT_DIR/Dockerfile" "$ROOT_DIR" "" "$SKIP_BUILD"
-
-run_logged agents-delete-shared-workspace docker_cmd docker run --rm \
+run_logged agents-delete-shared-workspace docker_e2e_docker_cmd run --rm \
+  "${DOCKER_E2E_HARNESS_ARGS[@]}" \
   --entrypoint bash \
   -e OPENCLAW_SKIP_CHANNELS=1 \
   -e OPENCLAW_SKIP_PROVIDERS=1 \
@@ -28,100 +28,41 @@ run_logged agents-delete-shared-workspace docker_cmd docker run --rm \
   -e OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
   -e OPENCLAW_SKIP_ACPX_RUNTIME=1 \
   -e OPENCLAW_SKIP_ACPX_RUNTIME_PROBE=1 \
+  -e OPENCLAW_GATEWAY_TOKEN=agents-delete-shared-workspace-token \
+  -e "OPENCLAW_TEST_STATE_SCRIPT_B64=$OPENCLAW_TEST_STATE_SCRIPT_B64" \
   "$IMAGE_NAME" \
   -lc '
 set -euo pipefail
+source scripts/lib/openclaw-e2e-instance.sh
 
-run_openclaw() {
-  if command -v openclaw >/dev/null 2>&1; then
-    openclaw "$@"
-    return
-  fi
-  if [ -f /app/openclaw.mjs ]; then
-    node /app/openclaw.mjs "$@"
-    return
-  fi
-  echo "openclaw CLI not found in Docker image" >&2
-  exit 1
+openclaw_e2e_eval_test_state_from_b64 "${OPENCLAW_TEST_STATE_SCRIPT_B64:?missing OPENCLAW_TEST_STATE_SCRIPT_B64}"
+export SHARED_WORKSPACE="$HOME/workspace-shared"
+output_file="$HOME/delete.json"
+agents_file="$HOME/agents.json"
+gateway_log="$HOME/gateway.log"
+gateway_pid=""
+
+cleanup() {
+  openclaw_e2e_terminate_gateways "${gateway_pid:-}"
+  rm -rf "$HOME"
 }
-
-home_dir="$(mktemp -d /tmp/openclaw-agents-delete-e2e-home.XXXXXX)"
-export HOME="$home_dir"
-export OPENCLAW_HOME="$home_dir"
-export OPENCLAW_STATE_DIR="$home_dir/.openclaw"
-export SHARED_WORKSPACE="$home_dir/workspace-shared"
-output_file="$home_dir/delete.json"
-trap '\''rm -rf "$home_dir"'\'' EXIT
+dump_logs_on_error() {
+  local status=$?
+  openclaw_e2e_print_log "$gateway_log" >&2
+  exit "$status"
+}
+trap cleanup EXIT
+trap dump_logs_on_error ERR
 
 mkdir -p "$OPENCLAW_STATE_DIR" "$SHARED_WORKSPACE"
-node --input-type=module - <<'\''NODE'\''
-import fs from "node:fs";
-import path from "node:path";
+entry="$(openclaw_e2e_resolve_entrypoint)"
+node "$entry" agents add alpha --workspace "$SHARED_WORKSPACE" --non-interactive
+node "$entry" agents add ops --workspace "$SHARED_WORKSPACE" --non-interactive
+gateway_pid="$(openclaw_e2e_start_gateway "$entry" 18789 "$gateway_log")"
+openclaw_e2e_wait_gateway_ready "$gateway_pid" "$gateway_log" 300 18789
 
-const stateDir = process.env.OPENCLAW_STATE_DIR;
-const sharedWorkspace = process.env.SHARED_WORKSPACE;
-if (!stateDir || !sharedWorkspace) {
-  throw new Error("missing OPENCLAW_STATE_DIR or SHARED_WORKSPACE");
-}
-fs.mkdirSync(stateDir, { recursive: true });
-fs.mkdirSync(sharedWorkspace, { recursive: true });
-fs.writeFileSync(
-  path.join(stateDir, "openclaw.json"),
-  `${JSON.stringify(
-    {
-      agents: {
-        list: [
-          { id: "main", workspace: sharedWorkspace },
-          { id: "ops", workspace: sharedWorkspace },
-        ],
-      },
-    },
-    null,
-    2,
-  )}\n`,
-);
-NODE
+node "$entry" agents delete ops --force --json > "$output_file"
+node "$entry" agents list --json > "$agents_file"
 
-run_openclaw agents delete ops --force --json > "$output_file"
-
-node --input-type=module - "$output_file" <<'\''NODE'\''
-import fs from "node:fs";
-import path from "node:path";
-
-const outputPath = process.argv[2];
-const raw = fs.readFileSync(outputPath, "utf8").trim();
-let parsed;
-try {
-  parsed = JSON.parse(raw);
-} catch (error) {
-  console.error("agents delete --json did not emit valid JSON:");
-  console.error(raw);
-  throw error;
-}
-
-function assert(condition, message) {
-  if (!condition) {
-    throw new Error(message);
-  }
-}
-
-assert(parsed.agentId === "ops", `unexpected agentId: ${JSON.stringify(parsed.agentId)}`);
-assert(parsed.workspace === process.env.SHARED_WORKSPACE, "deleted agent workspace mismatch");
-assert(parsed.workspaceRetained === true, "shared workspace was not marked retained");
-assert(parsed.workspaceRetainedReason === "shared", "missing shared retained reason");
-assert(
-  Array.isArray(parsed.workspaceSharedWith) && parsed.workspaceSharedWith.includes("main"),
-  "missing shared-with main marker",
-);
-assert(fs.existsSync(process.env.SHARED_WORKSPACE), "shared workspace was removed");
-
-const configPath = path.join(process.env.OPENCLAW_STATE_DIR, "openclaw.json");
-const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-const remaining = config?.agents?.list ?? [];
-assert(Array.isArray(remaining), "agents list missing after delete");
-assert(!remaining.some((entry) => entry?.id === "ops"), "deleted agent remained in config");
-assert(remaining.some((entry) => entry?.id === "main"), "main agent missing after delete");
-
-console.log("agents delete shared workspace smoke ok");
-NODE
+node scripts/e2e/lib/fixture.mjs agents-delete-assert "$output_file" "$agents_file"
 '

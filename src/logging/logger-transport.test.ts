@@ -1,5 +1,6 @@
+// Logger transport tests cover file and console transport routing.
+import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { importFreshModule } from "../../test/helpers/import-fresh.js";
 import { createSuiteLogPathTracker } from "./log-test-helpers.js";
 
 type LoggerModule = typeof import("./logger.js");
@@ -43,9 +44,7 @@ describe("logger transport registry", () => {
     expect(
       (loggerModule as unknown as Record<string, unknown>).registerLogTransport,
     ).toBeUndefined();
-    expect(
-      (loggerModule.__test__ as unknown as Record<string, unknown>).registerLogTransportForTest,
-    ).toBeUndefined();
+    expect((loggerModule as unknown as Record<string, unknown>).testApi).toBeUndefined();
   });
 
   it("does not publish mutable log transport state on a well-known global symbol", async () => {

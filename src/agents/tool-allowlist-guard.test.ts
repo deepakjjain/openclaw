@@ -1,3 +1,5 @@
+// Tool allowlist guard tests cover fail-closed behavior when explicit
+// allowlists leave no callable tools for the selected runtime/model.
 import { describe, expect, it } from "vitest";
 import {
   buildEmptyExplicitToolAllowlistError,
@@ -8,7 +10,7 @@ describe("tool allowlist guard", () => {
   it("fails closed when explicit allowlists resolve to no callable tools", () => {
     const error = buildEmptyExplicitToolAllowlistError({
       sources: [{ label: "tools.allow", entries: [" query_db "] }],
-      callableToolNames: [],
+      hasCallableTools: false,
       toolsEnabled: true,
     });
 
@@ -19,8 +21,10 @@ describe("tool allowlist guard", () => {
 
   it("fails closed for runtime toolsAllow when tools are disabled", () => {
     const error = buildEmptyExplicitToolAllowlistError({
-      sources: [{ label: "runtime toolsAllow", entries: ["query_db"] }],
-      callableToolNames: [],
+      sources: [
+        { label: "runtime toolsAllow", entries: ["query_db"], enforceWhenToolsDisabled: true },
+      ],
+      hasCallableTools: false,
       toolsEnabled: true,
       disableTools: true,
     });
@@ -29,10 +33,49 @@ describe("tool allowlist guard", () => {
     expect(error?.message).toContain("tools are disabled for this run");
   });
 
+  it("allows inherited config allowlists when a run intentionally disables tools", () => {
+    // Explicit runtime allowlists are command-time intent, while inherited
+    // config allowlists should not block a deliberately text-only run.
+    expect(
+      buildEmptyExplicitToolAllowlistError({
+        sources: [{ label: "tools.allow", entries: ["lobster", "llm-task"] }],
+        hasCallableTools: false,
+        toolsEnabled: true,
+        disableTools: true,
+      }),
+    ).toBeNull();
+  });
+
+  it("allows inherited config allowlists when runtime toolsAllow is explicitly empty", () => {
+    expect(
+      buildEmptyExplicitToolAllowlistError({
+        sources: [{ label: "tools.allow", entries: ["*", "read", "cron"] }],
+        hasCallableTools: false,
+        toolsEnabled: true,
+        toolsAllowExplicitlyEmpty: true,
+      }),
+    ).toBeNull();
+  });
+
+  it("still enforces command-time allowlists for explicitly tool-less runs", () => {
+    const error = buildEmptyExplicitToolAllowlistError({
+      sources: [
+        { label: "tools.allow", entries: ["read"] },
+        { label: "runtime toolsAllow", entries: ["query_db"], enforceWhenToolsDisabled: true },
+      ],
+      hasCallableTools: false,
+      toolsEnabled: true,
+      toolsAllowExplicitlyEmpty: true,
+    });
+
+    expect(error?.message).toContain("runtime toolsAllow: query_db");
+    expect(error?.message).not.toContain("tools.allow: read");
+  });
+
   it("fails closed when the selected model cannot use requested tools", () => {
     const error = buildEmptyExplicitToolAllowlistError({
       sources: [{ label: "agents.db.tools.allow", entries: ["query_db"] }],
-      callableToolNames: [],
+      hasCallableTools: false,
       toolsEnabled: false,
     });
 
@@ -44,7 +87,7 @@ describe("tool allowlist guard", () => {
     expect(
       buildEmptyExplicitToolAllowlistError({
         sources: [],
-        callableToolNames: [],
+        hasCallableTools: false,
         toolsEnabled: true,
       }),
     ).toBeNull();
@@ -54,7 +97,7 @@ describe("tool allowlist guard", () => {
     expect(
       buildEmptyExplicitToolAllowlistError({
         sources: [{ label: "tools.allow", entries: ["read", "missing_tool"] }],
-        callableToolNames: ["read"],
+        hasCallableTools: true,
         toolsEnabled: true,
       }),
     ).toBeNull();
@@ -63,13 +106,21 @@ describe("tool allowlist guard", () => {
   it("keeps source labels for config and runtime allowlists", () => {
     const sources = collectExplicitToolAllowlistSources([
       { label: "tools.allow", allow: [" read ", ""] },
-      { label: "runtime toolsAllow", allow: ["query_db"] },
+      {
+        label: "runtime toolsAllow",
+        allow: ["query_db"],
+        enforceWhenToolsDisabled: true,
+      },
       { label: "tools.byProvider.allow" },
     ]);
 
     expect(sources).toEqual([
       { label: "tools.allow", entries: ["read"] },
-      { label: "runtime toolsAllow", entries: ["query_db"] },
+      {
+        label: "runtime toolsAllow",
+        entries: ["query_db"],
+        enforceWhenToolsDisabled: true,
+      },
     ]);
   });
 });

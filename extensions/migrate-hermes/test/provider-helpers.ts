@@ -1,32 +1,17 @@
+// Migrate Hermes provider module implements model/runtime integration.
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { MigrationProviderContext } from "openclaw/plugin-sdk/plugin-entry";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/provider-auth";
-import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
 
-const tempRoots = new Set<string>();
+function noop() {}
 
-export const logger = {
-  info() {},
-  warn() {},
-  error() {},
-  debug() {},
+const logger: MigrationProviderContext["logger"] = {
+  debug: noop,
+  error: noop,
+  info: noop,
+  warn: noop,
 };
-
-export async function makeTempRoot() {
-  const root = await fs.mkdtemp(
-    path.join(resolvePreferredOpenClawTmpDir(), "openclaw-migrate-hermes-"),
-  );
-  tempRoots.add(root);
-  return root;
-}
-
-export async function cleanupTempRoots() {
-  for (const root of tempRoots) {
-    await fs.rm(root, { force: true, recursive: true });
-  }
-  tempRoots.clear();
-}
 
 export async function writeFile(filePath: string, content: string) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -37,15 +22,45 @@ export function makeConfigRuntime(
   config: OpenClawConfig,
   onWrite?: (next: OpenClawConfig) => void,
 ): NonNullable<MigrationProviderContext["runtime"]> {
+  const commitConfig = (next: OpenClawConfig) => {
+    (Object.keys(config) as Array<keyof OpenClawConfig>).forEach((key) => delete config[key]);
+    Object.assign(config, next);
+    onWrite?.(next);
+  };
+
   return {
     config: {
-      loadConfig: () => config,
-      writeConfigFile: async (next: OpenClawConfig) => {
-        for (const key of Object.keys(config) as Array<keyof OpenClawConfig>) {
-          delete config[key];
-        }
-        Object.assign(config, next);
-        onWrite?.(next);
+      current: () => config,
+      mutateConfigFile: async ({
+        afterWrite,
+        mutate,
+      }: {
+        afterWrite?: unknown;
+        mutate: (draft: OpenClawConfig, context: unknown) => Promise<unknown> | void;
+      }) => {
+        const next = structuredClone(config);
+        const result = await mutate(next, {
+          previousHash: null,
+          persistedHash: null,
+          snapshot: { config, raw: "", hash: null },
+        });
+        commitConfig(next);
+        return {
+          afterWrite,
+          followUp: { mode: "auto", requiresRestart: false },
+          nextConfig: next,
+          result,
+        };
+      },
+      replaceConfigFile: async ({
+        afterWrite,
+        nextConfig,
+      }: {
+        afterWrite?: unknown;
+        nextConfig: OpenClawConfig;
+      }) => {
+        commitConfig(nextConfig);
+        return { afterWrite, followUp: { mode: "auto", requiresRestart: false }, nextConfig };
       },
     },
   } as NonNullable<MigrationProviderContext["runtime"]>;
@@ -58,6 +73,8 @@ export function makeContext(params: {
   config?: OpenClawConfig;
   includeSecrets?: boolean;
   overwrite?: boolean;
+  itemKinds?: string[];
+  targetAgentId?: string;
   model?: NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]>["model"];
   reportDir?: string;
   runtime?: MigrationProviderContext["runtime"];
@@ -78,6 +95,8 @@ export function makeContext(params: {
     source: params.source,
     includeSecrets: params.includeSecrets,
     overwrite: params.overwrite,
+    itemKinds: params.itemKinds,
+    targetAgentId: params.targetAgentId,
     reportDir: params.reportDir,
     runtime: params.runtime,
     logger,

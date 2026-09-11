@@ -1,17 +1,15 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
-import type { ImageGenerationProvider } from "openclaw/plugin-sdk/image-generation";
-import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
-import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
+import { isIP } from "node:net";
+import { bufferToBlobPart } from "openclaw/plugin-sdk/blob-runtime";
+// Litellm provider module implements model/runtime integration.
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
-  assertOkOrThrowHttpError,
-  postJsonRequest,
-  resolveProviderHttpRequestConfig,
-  sanitizeConfiguredModelProviderRequest,
-} from "openclaw/plugin-sdk/provider-http";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+  createOpenAiCompatibleImageGenerationProvider,
+  imageSourceUploadFileName,
+  type ImageGenerationProvider,
+} from "openclaw/plugin-sdk/image-generation";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { LITELLM_BASE_URL } from "./onboard.js";
 
-const DEFAULT_OUTPUT_MIME = "image/png";
 const DEFAULT_SIZE = "1024x1024";
 const DEFAULT_LITELLM_IMAGE_MODEL = "gpt-image-2";
 const LITELLM_SUPPORTED_SIZES = [
@@ -61,7 +59,8 @@ function isAutoAllowedLitellmHostname(hostname: string): boolean {
   ) {
     return true;
   }
-  if (lowered === "127.0.0.1" || lowered.startsWith("127.")) {
+  // Only IPv4 literals may use the 127/8 loopback exemption.
+  if (isIP(lowered) === 4 && lowered.startsWith("127.")) {
     return true;
   }
   if (lowered === "::1" || lowered === "0:0:0:0:0:0:0:1") {
@@ -82,28 +81,12 @@ function shouldAutoAllowPrivateLitellmEndpoint(baseUrl: string): boolean {
   }
 }
 
-function toDataUrl(buffer: Buffer, mimeType: string): string {
-  return `data:${mimeType};base64,${buffer.toString("base64")}`;
-}
-
-type LitellmImageApiResponse = {
-  data?: Array<{
-    b64_json?: string;
-    revised_prompt?: string;
-  }>;
-};
-
 export function buildLitellmImageGenerationProvider(): ImageGenerationProvider {
-  return {
+  return createOpenAiCompatibleImageGenerationProvider({
     id: "litellm",
     label: "LiteLLM",
     defaultModel: DEFAULT_LITELLM_IMAGE_MODEL,
     models: [DEFAULT_LITELLM_IMAGE_MODEL],
-    isConfigured: ({ agentDir }) =>
-      isProviderApiKeyConfigured({
-        provider: "litellm",
-        agentDir,
-      }),
     capabilities: {
       generate: {
         maxCount: 4,
@@ -123,98 +106,46 @@ export function buildLitellmImageGenerationProvider(): ImageGenerationProvider {
         sizes: [...LITELLM_SUPPORTED_SIZES],
       },
     },
-    async generateImage(req) {
-      const inputImages = req.inputImages ?? [];
-      const isEdit = inputImages.length > 0;
-      const auth = await resolveApiKeyForProvider({
-        provider: "litellm",
-        cfg: req.cfg,
-        agentDir: req.agentDir,
-        store: req.authStore,
-      });
-      if (!auth.apiKey) {
-        throw new Error("LiteLLM API key missing");
-      }
-      const providerConfig = resolveLitellmProviderConfig(req.cfg);
-      const resolvedBaseUrl = resolveConfiguredLitellmBaseUrl(req.cfg);
-      const { baseUrl, allowPrivateNetwork, headers, dispatcherPolicy } =
-        resolveProviderHttpRequestConfig({
-          baseUrl: resolvedBaseUrl,
-          defaultBaseUrl: LITELLM_BASE_URL,
-          allowPrivateNetwork: shouldAutoAllowPrivateLitellmEndpoint(resolvedBaseUrl)
-            ? true
-            : undefined,
-          request: sanitizeConfiguredModelProviderRequest(providerConfig?.request),
-          defaultHeaders: {
-            Authorization: `Bearer ${auth.apiKey}`,
-          },
-          provider: "litellm",
-          capability: "image",
-          transport: "http",
-        });
-
-      const model = req.model || DEFAULT_LITELLM_IMAGE_MODEL;
-      const count = req.count ?? 1;
-      const size = req.size ?? DEFAULT_SIZE;
-
-      const jsonHeaders = new Headers(headers);
-      jsonHeaders.set("Content-Type", "application/json");
-      const endpoint = isEdit ? "images/edits" : "images/generations";
-      const body = isEdit
-        ? {
-            model,
-            prompt: req.prompt,
-            n: count,
-            size,
-            images: inputImages.map((image) => ({
-              image_url: toDataUrl(image.buffer, image.mimeType?.trim() || DEFAULT_OUTPUT_MIME),
-            })),
-          }
-        : {
-            model,
-            prompt: req.prompt,
-            n: count,
-            size,
-          };
-      const { response, release } = await postJsonRequest({
-        url: `${baseUrl}/${endpoint}`,
-        headers: jsonHeaders,
-        body,
-        timeoutMs: req.timeoutMs,
-        fetchFn: fetch,
-        allowPrivateNetwork,
-        dispatcherPolicy,
-      });
-      try {
-        await assertOkOrThrowHttpError(
-          response,
-          isEdit ? "LiteLLM image edit failed" : "LiteLLM image generation failed",
+    defaultBaseUrl: LITELLM_BASE_URL,
+    resolveBaseUrl: ({ req }) => resolveConfiguredLitellmBaseUrl(req.cfg),
+    resolveAllowPrivateNetwork: ({ baseUrl }) =>
+      shouldAutoAllowPrivateLitellmEndpoint(baseUrl) ? true : undefined,
+    useConfiguredRequest: true,
+    buildGenerateRequest: ({ req, model, count }) => ({
+      kind: "json",
+      body: {
+        model,
+        prompt: req.prompt,
+        n: count,
+        size: req.size ?? DEFAULT_SIZE,
+      },
+    }),
+    // LiteLLM's /v1/images/edits is multipart (OpenAI's edits schema): the
+    // reference image must be an uploaded file part, not a JSON field — a JSON
+    // body fails before the request reaches the provider.
+    buildEditRequest: ({ req, inputImages, model, count }) => {
+      const form = new FormData();
+      form.set("model", model);
+      form.set("prompt", req.prompt);
+      form.set("n", String(count));
+      form.set("size", req.size ?? DEFAULT_SIZE);
+      // OpenAI-compatible edits take repeated `image[]` parts when more than one
+      // reference is supplied, and a single `image` part otherwise.
+      const partName = inputImages.length > 1 ? "image[]" : "image";
+      for (const [index, image] of inputImages.entries()) {
+        const mimeType = normalizeOptionalString(image.mimeType) ?? "image/png";
+        form.append(
+          partName,
+          new Blob([bufferToBlobPart(image.buffer)], { type: mimeType }),
+          imageSourceUploadFileName({ image, index }),
         );
-
-        const data = (await response.json()) as LitellmImageApiResponse;
-        const images = (data.data ?? [])
-          .map((entry, index) => {
-            if (!entry.b64_json) {
-              return null;
-            }
-            return Object.assign(
-              {
-                buffer: Buffer.from(entry.b64_json, `base64`),
-                mimeType: DEFAULT_OUTPUT_MIME,
-                fileName: `image-${index + 1}.png`,
-              },
-              entry.revised_prompt ? { revisedPrompt: entry.revised_prompt } : {},
-            );
-          })
-          .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-
-        return {
-          images,
-          model,
-        };
-      } finally {
-        await release();
       }
+      return { kind: "multipart", form };
     },
-  };
+    missingApiKeyError: "LiteLLM API key missing",
+    failureLabels: {
+      generate: "LiteLLM image generation failed",
+      edit: "LiteLLM image edit failed",
+    },
+  });
 }

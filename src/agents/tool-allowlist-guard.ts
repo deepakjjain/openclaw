@@ -1,31 +1,54 @@
-import { normalizeToolName } from "./tool-policy.js";
+/**
+ * Explicit tool allowlist guard.
+ *
+ * Collects operator/user allowlist sources and explains when no callable tools remain.
+ */
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { normalizeToolPolicyName } from "./tool-policy.js";
 
-export type ExplicitToolAllowlistSource = {
+type ExplicitToolAllowlistSource = {
   label: string;
   entries: string[];
+  enforceWhenToolsDisabled?: boolean;
 };
 
+/** Normalize explicit allowlist sources, dropping empty source entries. */
 export function collectExplicitToolAllowlistSources(
-  sources: Array<{ label: string; allow?: string[] }>,
+  sources: Array<{ label: string; allow?: string[]; enforceWhenToolsDisabled?: boolean }>,
 ): ExplicitToolAllowlistSource[] {
   return sources.flatMap((source) => {
-    const entries = (source.allow ?? []).map((entry) => entry.trim()).filter(Boolean);
-    return entries.length ? [{ label: source.label, entries }] : [];
+    const entries = normalizeStringEntries(source.allow);
+    if (entries.length === 0) {
+      return [];
+    }
+    return [
+      {
+        label: source.label,
+        entries,
+        ...(source.enforceWhenToolsDisabled === true ? { enforceWhenToolsDisabled: true } : {}),
+      },
+    ];
   });
 }
 
+/** Build an actionable error when explicit allowlists remove every callable tool. */
 export function buildEmptyExplicitToolAllowlistError(params: {
   sources: ExplicitToolAllowlistSource[];
-  callableToolNames: string[];
+  hasCallableTools: boolean;
   toolsEnabled: boolean;
   disableTools?: boolean;
+  toolsAllowExplicitlyEmpty?: boolean;
 }): Error | null {
-  const callableToolNames = params.callableToolNames.map(normalizeToolName).filter(Boolean);
-  if (params.sources.length === 0 || callableToolNames.length > 0) {
+  const toolsIntentionallyDisabled =
+    params.disableTools === true || params.toolsAllowExplicitlyEmpty === true;
+  const sources = toolsIntentionallyDisabled
+    ? params.sources.filter((source) => source.enforceWhenToolsDisabled === true)
+    : params.sources;
+  if (sources.length === 0 || params.hasCallableTools) {
     return null;
   }
-  const requested = params.sources
-    .map((source) => `${source.label}: ${source.entries.map(normalizeToolName).join(", ")}`)
+  const requested = sources
+    .map((source) => `${source.label}: ${source.entries.map(normalizeToolPolicyName).join(", ")}`)
     .join("; ");
   const reason =
     params.disableTools === true

@@ -1,20 +1,19 @@
+import type { z } from "zod";
+// Defines agent routing, model, and runtime configuration types.
 import type { ChatType } from "../channels/chat-type.js";
 import type {
   AgentContextLimitsConfig,
   AgentDefaultsConfig,
-  EmbeddedPiExecutionContract,
+  AgentModelEntryConfig,
 } from "./types.agent-defaults.js";
-import type {
-  AgentEmbeddedHarnessConfig,
-  AgentModelConfig,
-  AgentRuntimePolicyConfig,
-  AgentSandboxConfig,
-} from "./types.agents-shared.js";
-import type { DmScope, HumanDelayConfig, IdentityConfig } from "./types.base.js";
+import type { AgentSandboxConfig } from "./types.agents-shared.js";
+import type { DmScope, GroupScope, HumanDelayConfig, IdentityConfig } from "./types.base.js";
+import type { MemorySearchConfig } from "./types.memory.js";
 import type { GroupChatConfig } from "./types.messages.js";
 import type { SkillsLimitsConfig } from "./types.skills.js";
-import type { AgentToolsConfig, MemorySearchConfig } from "./types.tools.js";
+import type { AgentToolsConfig } from "./types.tools.js";
 import type { TtsConfig } from "./types.tts.js";
+import type { AgentEntryBaseSchema } from "./zod-schema.agent-entry-base.js";
 
 export type AgentRuntimeAcpConfig = {
   /** ACP harness adapter id (for example codex, claude). */
@@ -38,6 +37,12 @@ export type AgentRuntimeConfig =
 
 export type AgentBindingMatch = {
   channel: string;
+  /**
+   * Channel account to match.
+   * - Omitted/empty: matches only the channel default account.
+   * - "*": matches every account on the channel.
+   * - Any other string: matches that specific account id.
+   */
   accountId?: string;
   peer?: { kind: ChatType; id: string };
   guildId?: string;
@@ -55,6 +60,7 @@ export type AgentRouteBinding = {
   session?: {
     /** Optional session scoping override for conversations matched by this binding. */
     dmScope?: DmScope;
+    groupScope?: GroupScope;
   };
 };
 
@@ -73,66 +79,38 @@ export type AgentAcpBinding = {
 
 export type AgentBinding = AgentRouteBinding | AgentAcpBinding;
 
-export type AgentConfig = {
-  id: string;
+export type AgentConfig = z.input<typeof AgentEntryBaseSchema> & {
+  /** @deprecated Raw legacy list compatibility only; canonical agents.entries rejects this key. */
   default?: boolean;
-  name?: string;
-  workspace?: string;
-  agentDir?: string;
-  /** Optional per-agent full system prompt replacement. */
-  systemPromptOverride?: AgentDefaultsConfig["systemPromptOverride"];
-  /** Optional per-agent agent runtime policy override. */
-  agentRuntime?: AgentRuntimePolicyConfig;
-  /** @deprecated Use agentRuntime. */
-  embeddedHarness?: AgentEmbeddedHarnessConfig;
-  model?: AgentModelConfig;
-  /** Optional per-agent default thinking level (overrides agents.defaults.thinkingDefault). */
-  thinkingDefault?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "adaptive" | "max";
-  /** Optional per-agent default verbosity level. */
-  verboseDefault?: "off" | "on" | "full";
-  /** Optional per-agent default reasoning visibility. */
-  reasoningDefault?: "on" | "off" | "stream";
-  /** Optional per-agent default for fast mode. */
-  fastModeDefault?: boolean;
-  /** Optional allowlist of skills for this agent; omitting it inherits agents.defaults.skills when set, and an explicit list replaces defaults instead of merging. */
-  skills?: string[];
-  memorySearch?: MemorySearchConfig;
-  /** Human-like delay between block replies for this agent. */
+  /**
+   * @deprecated Legacy raw config accepted only by doctor/migration repair.
+   * Normal schema parsing rejects this key; use per-model agentRuntime instead.
+   */
+  agentRuntime?: AgentModelEntryConfig["agentRuntime"];
+  /** @deprecated Legacy per-agent compaction config is kept for raw doctor migration/repair. */
+  compaction?: AgentDefaultsConfig["compaction"];
+  memory?: {
+    search?: MemorySearchConfig;
+  };
   humanDelay?: HumanDelayConfig;
-  /** Optional per-agent TTS overrides, deep-merged over messages.tts. */
-  tts?: TtsConfig;
-  /** Optional per-agent skills subsystem overrides. */
+  typingMode?: AgentDefaultsConfig["typingMode"];
+  tts?: TtsConfig & { prefsPath?: string };
   skillsLimits?: Pick<SkillsLimitsConfig, "maxSkillsPromptChars">;
-  /** Optional per-agent overrides for selected context/token-heavy limits. */
   contextLimits?: AgentContextLimitsConfig;
-  contextTokens?: number;
-  /** Optional per-agent heartbeat overrides. */
-  heartbeat?: AgentDefaultsConfig["heartbeat"];
+  heartbeat?: Omit<NonNullable<AgentDefaultsConfig["heartbeat"]>, "agentId">;
   identity?: IdentityConfig;
-  groupChat?: GroupChatConfig;
-  subagents?: {
-    /** Allow spawning sub-agents under other agent ids. Use "*" to allow any. */
-    allowAgents?: string[];
-    /** Per-agent default model for spawned sub-agents (string or {primary,fallbacks}). */
-    model?: AgentModelConfig;
-    /** Require explicit agentId in sessions_spawn (no default same-as-caller). */
-    requireAgentId?: boolean;
-  };
-  /** Optional per-agent embedded Pi overrides. */
-  embeddedPi?: {
-    /** Optional per-agent execution contract override. */
-    executionContract?: EmbeddedPiExecutionContract;
-  };
+  groupChat?: Omit<GroupChatConfig, "visibleReplies">;
   /** Optional per-agent sandbox overrides. */
   sandbox?: AgentSandboxConfig;
-  /** Optional per-agent stream params (e.g. cacheRetention, temperature). */
-  params?: Record<string, unknown>;
   tools?: AgentToolsConfig;
-  /** Optional runtime descriptor for this agent. */
-  runtime?: AgentRuntimeConfig;
 };
 
+export type AgentEntryConfig = Omit<AgentConfig, "id">;
+
 export type AgentsConfig = {
+  ownership?: "explicit";
   defaults?: AgentDefaultsConfig;
+  entries?: Record<string, AgentEntryConfig>;
+  /** Internal non-serialized projection materialized by validation for ID-based runtime code. */
   list?: AgentConfig[];
 };

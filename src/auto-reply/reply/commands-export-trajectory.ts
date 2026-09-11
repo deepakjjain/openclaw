@@ -1,181 +1,204 @@
-import fs from "node:fs";
-import path from "node:path";
+// Implements trajectory export command packaging for the active session agent.
+import { createExecTool } from "../../agents/bash-tools.js";
 import { formatErrorMessage } from "../../infra/errors.js";
-import {
-  exportTrajectoryBundle,
-  resolveDefaultTrajectoryExportDir,
-} from "../../trajectory/export.js";
 import type { ReplyPayload } from "../types.js";
+import { formatCommandExecResult, formatCommandExecText } from "./command-exec-result.js";
+import { parseExportCommandOutputPath } from "./commands-export-common.js";
+import { buildCurrentOpenClawCliExecRequest } from "./commands-openclaw-cli.js";
 import {
-  isReplyPayload,
-  parseExportCommandOutputPath,
-  resolveExportCommandSessionTarget,
-} from "./commands-export-common.js";
+  buildPrivateCommandApprovalRequest,
+  deliverPrivateCommandReply,
+  resolveCommandExecApprovalRoute,
+  resolvePrivateCommandRouteTargets,
+  type PrivateCommandRouteTarget,
+} from "./commands-private-route.js";
 import type { HandleCommandsParams } from "./commands-types.js";
 
-function isPathInsideOrEqual(baseDir: string, candidate: string): boolean {
-  const relative = path.relative(baseDir, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
+const EXPORT_TRAJECTORY_DOCS_URL = "https://docs.openclaw.ai/tools/trajectory";
+const EXPORT_TRAJECTORY_EXEC_SCOPE_KEY = "chat:export-trajectory";
+const MAX_TRAJECTORY_EXPORT_ENCODED_REQUEST_CHARS = 8192;
+const EXPORT_TRAJECTORY_PRIVATE_ROUTE_UNAVAILABLE =
+  "I couldn't find a private owner approval route for the trajectory export. Run /export-trajectory from an owner DM so the sensitive trajectory bundle is not posted in this chat.";
+const EXPORT_TRAJECTORY_PRIVATE_ROUTE_REPLIES = {
+  delivered:
+    "Trajectory exports are sensitive. I sent the trajectory export details to the owner privately.",
+  pending:
+    "Trajectory exports are sensitive. Private delivery of the export request is pending; I can't confirm receipt yet.",
+  suppressed:
+    "Trajectory exports are sensitive. Private delivery of the export request was suppressed.",
+  failed: EXPORT_TRAJECTORY_PRIVATE_ROUTE_UNAVAILABLE,
+};
 
-function validateExistingExportDirectory(params: {
-  dir: string;
-  label: string;
-  realWorkspace: string;
-}): string {
-  const linkStat = fs.lstatSync(params.dir);
-  if (linkStat.isSymbolicLink() || !linkStat.isDirectory()) {
-    throw new Error(`${params.label} must be a real directory inside the workspace`);
-  }
-  const realDir = fs.realpathSync(params.dir);
-  if (!isPathInsideOrEqual(params.realWorkspace, realDir)) {
-    throw new Error("Trajectory exports directory must stay inside the workspace");
-  }
-  return realDir;
-}
-
-function mkdirIfMissingThenValidate(params: {
-  dir: string;
-  label: string;
-  realWorkspace: string;
-}): string {
-  if (!fs.existsSync(params.dir)) {
-    try {
-      fs.mkdirSync(params.dir, { mode: 0o700 });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw error;
-      }
-    }
-  }
-  return validateExistingExportDirectory(params);
-}
-
-function resolveTrajectoryExportBaseDir(workspaceDir: string): {
-  baseDir: string;
-  realBase: string;
-} {
-  const workspacePath = path.resolve(workspaceDir);
-  const realWorkspace = fs.realpathSync(workspacePath);
-  const stateDir = path.join(workspacePath, ".openclaw");
-  mkdirIfMissingThenValidate({
-    dir: stateDir,
-    label: "OpenClaw state directory",
-    realWorkspace,
-  });
-  const baseDir = path.join(stateDir, "trajectory-exports");
-  const realBase = mkdirIfMissingThenValidate({
-    dir: baseDir,
-    label: "Trajectory exports directory",
-    realWorkspace,
-  });
-  return { baseDir: path.resolve(baseDir), realBase };
-}
-
-function resolveTrajectoryCommandOutputDir(params: {
-  outputPath?: string;
-  workspaceDir: string;
-  sessionId: string;
-}): string {
-  const { baseDir, realBase } = resolveTrajectoryExportBaseDir(params.workspaceDir);
-  const raw = params.outputPath?.trim();
-  if (!raw) {
-    const defaultDir = resolveDefaultTrajectoryExportDir({
-      workspaceDir: params.workspaceDir,
-      sessionId: params.sessionId,
-    });
-    return path.join(baseDir, path.basename(defaultDir));
-  }
-  if (path.isAbsolute(raw) || raw.startsWith("~")) {
-    throw new Error("Output path must be relative to the workspace trajectory exports directory");
-  }
-  const resolvedBase = path.resolve(baseDir);
-  const outputDir = path.resolve(resolvedBase, raw);
-  const relative = path.relative(resolvedBase, outputDir);
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error("Output path must stay inside the workspace trajectory exports directory");
-  }
-  let existingParent = outputDir;
-  while (!fs.existsSync(existingParent)) {
-    const next = path.dirname(existingParent);
-    if (next === existingParent) {
-      break;
-    }
-    existingParent = next;
-  }
-  const realExistingParent = fs.realpathSync(existingParent);
-  if (!isPathInsideOrEqual(realBase, realExistingParent)) {
-    throw new Error("Output path must stay inside the real trajectory exports directory");
-  }
-  return outputDir;
-}
-
-export async function buildExportTrajectoryReply(
+export async function buildExportTrajectoryCommandReply(
   params: HandleCommandsParams,
 ): Promise<ReplyPayload> {
   const args = parseExportCommandOutputPath(params.command.commandBodyNormalized, [
     "export-trajectory",
     "trajectory",
   ]);
-  const sessionTarget = resolveExportCommandSessionTarget(params);
-  if (isReplyPayload(sessionTarget)) {
-    return sessionTarget;
+  if (args.error) {
+    return { text: args.error };
   }
-  const { entry, sessionFile } = sessionTarget;
-
-  if (!fs.existsSync(sessionFile)) {
-    return { text: "❌ Session file not found." };
-  }
-
-  let outputDir: string;
+  let request: TrajectoryExportExecRequest;
   try {
-    outputDir = resolveTrajectoryCommandOutputDir({
-      outputPath: args.outputPath,
-      workspaceDir: params.workspaceDir,
-      sessionId: entry.sessionId,
+    request = buildTrajectoryExportExecRequest(params, args.outputPath);
+  } catch (error) {
+    return { text: `❌ Failed to prepare trajectory export request: ${formatErrorMessage(error)}` };
+  }
+  if (params.isGroup) {
+    const now = Date.now();
+    const targets = await resolvePrivateCommandRouteTargets({
+      commandParams: params,
+      request: buildPrivateCommandApprovalRequest({
+        commandParams: params,
+        id: "trajectory-export-private-route",
+        command: request.command,
+        commandArgv: request.argv,
+        agentId: params.agentId,
+        createdAtMs: now,
+      }),
     });
-  } catch (err) {
+    const privateTarget = targets[0];
+    if (!privateTarget) {
+      return { text: EXPORT_TRAJECTORY_PRIVATE_ROUTE_UNAVAILABLE };
+    }
+    const privateReply = await buildExportTrajectoryApprovalReply(params, request, {
+      privateApprovalTarget: privateTarget,
+    });
+    const outcome = await deliverPrivateCommandReply({
+      commandParams: params,
+      targets: [privateTarget],
+      reply: privateReply,
+    });
     return {
-      text: `❌ Failed to resolve output path: ${formatErrorMessage(err)}`,
+      text: EXPORT_TRAJECTORY_PRIVATE_ROUTE_REPLIES[outcome],
     };
   }
+  return await buildExportTrajectoryApprovalReply(params, request);
+}
 
-  let bundle: ReturnType<typeof exportTrajectoryBundle>;
-  try {
-    bundle = exportTrajectoryBundle({
-      outputDir,
-      sessionFile,
-      sessionId: entry.sessionId,
-      sessionKey: params.sessionKey,
-      workspaceDir: params.workspaceDir,
-    });
-  } catch (err) {
-    return {
-      text: `❌ Failed to export trajectory: ${formatErrorMessage(err)}`,
-    };
-  }
-
-  const relativePath = path.relative(params.workspaceDir, bundle.outputDir);
-  const displayPath =
-    relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)
-      ? relativePath
-      : path.basename(bundle.outputDir);
-  const files = ["manifest.json", "events.jsonl", "session-branch.json"];
-  if (bundle.events.some((event) => event.type === "context.compiled")) {
-    files.push("system-prompt.txt", "tools.json");
-  }
-  files.push(...bundle.supplementalFiles);
-
+async function buildExportTrajectoryApprovalReply(
+  params: HandleCommandsParams,
+  request: TrajectoryExportExecRequest,
+  options: { privateApprovalTarget?: PrivateCommandRouteTarget } = {},
+): Promise<ReplyPayload> {
   return {
     text: [
-      "✅ Trajectory exported!",
+      "Trajectory exports can include prompts, model messages, tool schemas, tool results, runtime events, and local paths.",
+      `Treat trajectory bundles like secrets and review them before sharing: ${EXPORT_TRAJECTORY_DOCS_URL}`,
       "",
-      `📦 Bundle: ${displayPath}`,
-      `🧵 Session: ${entry.sessionId}`,
-      `📊 Events: ${bundle.manifest.eventCount}`,
-      `🧪 Runtime events: ${bundle.manifest.runtimeEventCount}`,
-      `📝 Transcript events: ${bundle.manifest.transcriptEventCount}`,
-      `📁 Files: ${files.join(", ")}`,
+      formatTrajectoryExportRequestDetails(request.request),
+      "",
+      await requestTrajectoryExportApproval(params, request, options),
     ].join("\n"),
   };
+}
+
+async function requestTrajectoryExportApproval(
+  params: HandleCommandsParams,
+  request: TrajectoryExportExecRequest,
+  options: { privateApprovalTarget?: PrivateCommandRouteTarget } = {},
+): Promise<string> {
+  const timeoutSec = params.cfg.tools?.exec?.timeoutSeconds;
+  try {
+    const execTool = createExecTool({
+      host: "gateway",
+      security: "allowlist",
+      ask: "always",
+      trigger: "export-trajectory",
+      scopeKey: EXPORT_TRAJECTORY_EXEC_SCOPE_KEY,
+      allowBackground: true,
+      approvalFollowupMode: "agent",
+      timeoutSec,
+      cwd: params.workspaceDir,
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      sessionId: params.sessionEntry?.sessionId,
+      sessionStore: params.cfg.session?.store,
+      eventRouting: {
+        mainKey: params.cfg.session?.mainKey,
+        sessionScope: params.cfg.session?.scope,
+      },
+      ...resolveCommandExecApprovalRoute({
+        commandParams: params,
+        privateApprovalTarget: options.privateApprovalTarget,
+      }),
+      notifyOnExit: params.cfg.tools?.exec?.notifyOnExit,
+      notifyOnExitEmptySuccess: params.cfg.tools?.exec?.notifyOnExitEmptySuccess,
+    });
+    const result = await execTool.execute("chat-export-trajectory", {
+      command: request.command,
+      env: request.env,
+      ask: "always",
+      background: true,
+      timeoutSeconds: timeoutSec,
+    });
+    return [
+      `Trajectory bundle: requested \`${request.displayCommand}\` through exec approval. Approve once to create the bundle; do not use allow-all for trajectory exports.`,
+      formatCommandExecResult(result, "Trajectory export"),
+    ].join("\n");
+  } catch (error) {
+    return [
+      `Trajectory bundle: could not request exec approval for \`${request.displayCommand}\`.`,
+      formatCommandExecText(formatErrorMessage(error)),
+    ].join("\n");
+  }
+}
+
+type TrajectoryExportCliRequest = {
+  sessionKey: string;
+  workspace: string;
+  output?: string;
+  store?: string;
+  agent: string;
+};
+
+type TrajectoryExportExecRequest = {
+  argv: string[];
+  command: string;
+  env: Record<string, string> | undefined;
+  displayCommand: string;
+  encodedRequest: string;
+  request: TrajectoryExportCliRequest;
+};
+
+function buildTrajectoryExportExecRequest(
+  params: HandleCommandsParams,
+  outputPath?: string,
+): TrajectoryExportExecRequest {
+  const request: TrajectoryExportCliRequest = {
+    sessionKey: params.sessionKey,
+    workspace: params.workspaceDir,
+    agent: params.agentId,
+  };
+  if (outputPath) {
+    request.output = outputPath;
+  }
+  if (params.storePath && params.storePath !== "(multiple)") {
+    request.store = params.storePath;
+  }
+  const encodedRequest = Buffer.from(JSON.stringify(request), "utf8").toString("base64url");
+  if (encodedRequest.length > MAX_TRAJECTORY_EXPORT_ENCODED_REQUEST_CHARS) {
+    throw new Error("Encoded trajectory export request is too large");
+  }
+  const args = ["sessions", "export-trajectory", "--request-json-base64", encodedRequest, "--json"];
+  return {
+    ...buildCurrentOpenClawCliExecRequest(args),
+    displayCommand: ["openclaw", ...args].join(" "),
+    encodedRequest,
+    request,
+  };
+}
+
+function formatTrajectoryExportRequestDetails(request: TrajectoryExportCliRequest): string {
+  const lines = [
+    `Session: ${request.sessionKey}`,
+    `Workspace: ${request.workspace}`,
+    `Output: ${request.output ?? "(default)"}`,
+  ];
+  if (request.store) {
+    lines.push(`Store: ${request.store}`);
+  }
+  lines.push(`Agent: ${request.agent}`);
+  return lines.join("\n");
 }

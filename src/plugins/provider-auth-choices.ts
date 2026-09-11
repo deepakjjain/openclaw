@@ -1,10 +1,16 @@
-import { resolveProviderIdForAuth } from "../agents/provider-auth-aliases.js";
+// Builds provider auth choice lists from plugin setup metadata.
+import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { sanitizeForLog } from "../terminal/ansi.js";
 import { normalizePluginsConfig, resolveEffectiveEnableState } from "./config-state.js";
+import { loadManifestMetadataSnapshot } from "./manifest-contract-eligibility.js";
+import { passesManifestOwnerBasePolicy } from "./manifest-owner-policy.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
+import {
+  getOfficialExternalPluginCatalogManifest,
+  listOfficialExternalProviderCatalogEntries,
+} from "./official-external-plugin-catalog.js";
+import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
 import type { PluginOrigin } from "./plugin-origin.types.js";
-import { loadPluginManifestRegistryForPluginRegistry } from "./plugin-registry.js";
 
 export type ProviderAuthChoiceMetadata = {
   pluginId: string;
@@ -13,20 +19,30 @@ export type ProviderAuthChoiceMetadata = {
   choiceId: string;
   choiceLabel: string;
   choiceHint?: string;
+  icon?: string;
+  website?: string;
   assistantPriority?: number;
   assistantVisibility?: "visible" | "manual-only";
   deprecatedChoiceIds?: string[];
   groupId?: string;
   groupLabel?: string;
   groupHint?: string;
+  onboardingFeatured?: boolean;
   optionKey?: string;
   cliFlag?: string;
   cliOption?: string;
   cliDescription?: string;
-  onboardingScopes?: ("text-inference" | "image-generation")[];
+  appGuidedSecret?: boolean;
+  personalAccount?: boolean;
+  appGuidedActionLabel?: string;
+  appGuidedDiscovery?: boolean;
+  appGuidedAuth?: "oauth" | "device-code";
+  credentialOnly?: boolean;
+  channelLogin?: { aliases?: string[] };
+  onboardingScopes?: ("text-inference" | "image-generation" | "music-generation")[];
 };
 
-export type ProviderOnboardAuthFlag = {
+type ProviderOnboardAuthFlag = {
   optionKey: string;
   authChoice: string;
   cliFlag: string;
@@ -46,7 +62,9 @@ type ManifestProviderAuthChoiceParams = {
   config?: OpenClawConfig;
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
+  metadataSnapshot?: PluginMetadataSnapshot;
   includeUntrustedWorkspacePlugins?: boolean;
+  includeWorkspacePlugins?: boolean;
 };
 
 const PROVIDER_AUTH_CHOICE_ORIGIN_PRIORITY: Readonly<Record<PluginOrigin, number>> = {
@@ -86,6 +104,8 @@ function toProviderAuthChoiceCandidate(params: {
     choiceId: choice.choiceId,
     choiceLabel: choice.choiceLabel ?? choice.choiceId,
     ...(choice.choiceHint ? { choiceHint: choice.choiceHint } : {}),
+    ...(choice.icon ? { icon: choice.icon } : {}),
+    ...(choice.website ? { website: choice.website } : {}),
     ...(choice.assistantPriority !== undefined
       ? { assistantPriority: choice.assistantPriority }
       : {}),
@@ -94,10 +114,18 @@ function toProviderAuthChoiceCandidate(params: {
     ...(choice.groupId ? { groupId: choice.groupId } : {}),
     ...(choice.groupLabel ? { groupLabel: choice.groupLabel } : {}),
     ...(choice.groupHint ? { groupHint: choice.groupHint } : {}),
+    ...(choice.onboardingFeatured ? { onboardingFeatured: true } : {}),
     ...(choice.optionKey ? { optionKey: choice.optionKey } : {}),
     ...(choice.cliFlag ? { cliFlag: choice.cliFlag } : {}),
     ...(choice.cliOption ? { cliOption: choice.cliOption } : {}),
     ...(choice.cliDescription ? { cliDescription: choice.cliDescription } : {}),
+    ...(choice.appGuidedSecret ? { appGuidedSecret: true } : {}),
+    ...(choice.personalAccount ? { personalAccount: true } : {}),
+    ...(choice.appGuidedActionLabel ? { appGuidedActionLabel: choice.appGuidedActionLabel } : {}),
+    ...(choice.appGuidedDiscovery ? { appGuidedDiscovery: true } : {}),
+    ...(choice.appGuidedAuth ? { appGuidedAuth: choice.appGuidedAuth } : {}),
+    ...(choice.credentialOnly ? { credentialOnly: true } : {}),
+    ...(choice.channelLogin ? { channelLogin: choice.channelLogin } : {}),
     ...(choice.onboardingScopes ? { onboardingScopes: choice.onboardingScopes } : {}),
   };
 }
@@ -174,20 +202,26 @@ function stripChoiceOrigin(choice: ProviderAuthChoiceCandidate): ProviderAuthCho
   return metadata;
 }
 
-function resolveManifestProviderAuthChoiceCandidates(params?: {
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  includeUntrustedWorkspacePlugins?: boolean;
-}): ProviderAuthChoiceCandidate[] {
-  const registry = loadPluginManifestRegistryForPluginRegistry({
-    config: params?.config,
-    workspaceDir: params?.workspaceDir,
-    env: params?.env,
-    includeDisabled: true,
-  });
+function resolveManifestProviderAuthChoiceCandidates(
+  params?: ManifestProviderAuthChoiceParams,
+  declaredOnly = false,
+): ProviderAuthChoiceCandidate[] {
+  const metadataSnapshot =
+    params?.metadataSnapshot ??
+    loadManifestMetadataSnapshot({
+      config: params?.config ?? {},
+      workspaceDir: params?.workspaceDir,
+      env: params?.env ?? process.env,
+    });
+  const registry = metadataSnapshot.manifestRegistry;
   const normalizedConfig = normalizePluginsConfig(params?.config?.plugins);
   return registry.plugins.flatMap((plugin) => {
+    if (declaredOnly && !passesManifestOwnerBasePolicy({ plugin, normalizedConfig })) {
+      return [];
+    }
+    if (plugin.origin === "workspace" && params?.includeWorkspacePlugins === false) {
+      return [];
+    }
     if (
       plugin.origin === "workspace" &&
       params?.includeUntrustedWorkspacePlugins === false &&
@@ -210,7 +244,9 @@ function resolveManifestProviderAuthChoiceCandidates(params?: {
         }),
       );
     }
-    choices.push(...listSetupProviderAuthChoiceCandidates(plugin));
+    if (!declaredOnly) {
+      choices.push(...listSetupProviderAuthChoiceCandidates(plugin));
+    }
     return choices;
   });
 }
@@ -219,6 +255,7 @@ function pickPreferredManifestAuthChoice(
   candidates: readonly ProviderAuthChoiceCandidate[],
 ): ProviderAuthChoiceCandidate | undefined {
   let preferred: ProviderAuthChoiceCandidate | undefined;
+  let ambiguous = false;
   for (const candidate of candidates) {
     if (!preferred) {
       preferred = candidate;
@@ -229,30 +266,34 @@ function pickPreferredManifestAuthChoice(
       resolveProviderAuthChoiceOriginPriority(preferred.origin)
     ) {
       preferred = candidate;
+      ambiguous = false;
+    } else if (
+      resolveProviderAuthChoiceOriginPriority(candidate.origin) ===
+      resolveProviderAuthChoiceOriginPriority(preferred.origin)
+    ) {
+      ambiguous = true;
     }
   }
-  return preferred;
+  return ambiguous ? undefined : preferred;
 }
 
 function resolvePreferredManifestAuthChoicesByChoiceId(
   candidates: readonly ProviderAuthChoiceCandidate[],
 ): ProviderAuthChoiceCandidate[] {
-  const preferredByChoiceId = new Map<string, ProviderAuthChoiceCandidate>();
+  const byChoiceId = new Map<string, ProviderAuthChoiceCandidate[]>();
   for (const candidate of candidates) {
     const normalizedChoiceId = candidate.choiceId.trim();
     if (!normalizedChoiceId) {
       continue;
     }
-    const existing = preferredByChoiceId.get(normalizedChoiceId);
-    if (
-      !existing ||
-      resolveProviderAuthChoiceOriginPriority(candidate.origin) <
-        resolveProviderAuthChoiceOriginPriority(existing.origin)
-    ) {
-      preferredByChoiceId.set(normalizedChoiceId, candidate);
-    }
+    const group = byChoiceId.get(normalizedChoiceId) ?? [];
+    group.push(candidate);
+    byChoiceId.set(normalizedChoiceId, group);
   }
-  return [...preferredByChoiceId.values()];
+  return [...byChoiceId.values()].flatMap((group) => {
+    const preferred = pickPreferredManifestAuthChoice(group);
+    return preferred ? [preferred] : [];
+  });
 }
 
 function resolvePreferredManifestAuthChoiceMetadata(params: {
@@ -274,6 +315,17 @@ export function resolveManifestProviderAuthChoices(
   ).map(stripChoiceOrigin);
 }
 
+/** Executable declarations exclude workspace code and honor current plugin policy. */
+export function resolveManifestDeclaredProviderAuthChoices(
+  params?: ManifestProviderAuthChoiceParams,
+): ProviderAuthChoiceMetadata[] {
+  const candidates = resolveManifestProviderAuthChoiceCandidates(
+    { ...params, includeWorkspacePlugins: false },
+    true,
+  );
+  return resolvePreferredManifestAuthChoicesByChoiceId(candidates).map(stripChoiceOrigin);
+}
+
 export function resolveManifestProviderAuthChoice(
   choiceId: string,
   params?: ManifestProviderAuthChoiceParams,
@@ -285,25 +337,6 @@ export function resolveManifestProviderAuthChoice(
   return resolvePreferredManifestAuthChoiceMetadata({
     config: params,
     matches: (choice) => choice.choiceId === normalized,
-  });
-}
-
-export function resolveManifestProviderApiKeyChoice(params: {
-  providerId: string;
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  includeUntrustedWorkspacePlugins?: boolean;
-}): ProviderAuthChoiceMetadata | undefined {
-  const normalizedProviderId = resolveProviderIdForAuth(params.providerId, params);
-  if (!normalizedProviderId) {
-    return undefined;
-  }
-  return resolvePreferredManifestAuthChoiceMetadata({
-    config: params,
-    matches: (choice) =>
-      Boolean(choice.optionKey) &&
-      resolveProviderIdForAuth(choice.providerId, params) === normalizedProviderId,
   });
 }
 
@@ -321,7 +354,7 @@ export function resolveManifestDeprecatedProviderAuthChoice(
   });
 }
 
-export function resolveManifestProviderOnboardAuthFlags(
+function resolveManifestProviderOnboardAuthFlags(
   params?: ManifestProviderAuthChoiceParams,
 ): ProviderOnboardAuthFlag[] {
   const preferredByFlag = new Map<string, ProviderOnboardAuthFlagCandidate>();
@@ -357,6 +390,49 @@ export function resolveManifestProviderOnboardAuthFlags(
       cliOption: choice.cliOption,
       description: choice.cliDescription ?? choice.choiceLabel,
     });
+  }
+  return flags;
+}
+
+function resolveOfficialExternalProviderOnboardAuthFlags(): ProviderOnboardAuthFlag[] {
+  const flags: ProviderOnboardAuthFlag[] = [];
+  for (const entry of listOfficialExternalProviderCatalogEntries()) {
+    const manifest = getOfficialExternalPluginCatalogManifest(entry);
+    for (const provider of manifest?.providers ?? []) {
+      for (const choice of provider.authChoices ?? []) {
+        const optionKey = choice.optionKey?.trim();
+        const authChoice = choice.choiceId?.trim();
+        const cliFlag = choice.cliFlag?.trim();
+        const cliOption = choice.cliOption?.trim();
+        if (!optionKey || !authChoice || !cliFlag || !cliOption) {
+          continue;
+        }
+        flags.push({
+          optionKey,
+          authChoice,
+          cliFlag,
+          cliOption,
+          description: choice.cliDescription?.trim() || choice.choiceLabel?.trim() || authChoice,
+        });
+      }
+    }
+  }
+  return flags;
+}
+
+/** Resolves onboard auth flags from installed manifests and official cold-install metadata. */
+export function resolveProviderOnboardAuthFlags(
+  params?: ManifestProviderAuthChoiceParams,
+): ProviderOnboardAuthFlag[] {
+  const flags = resolveManifestProviderOnboardAuthFlags(params);
+  const seen = new Set(flags.map((flag) => `${flag.optionKey}::${flag.cliFlag}`));
+  for (const flag of resolveOfficialExternalProviderOnboardAuthFlags()) {
+    const dedupeKey = `${flag.optionKey}::${flag.cliFlag}`;
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    flags.push(flag);
   }
   return flags;
 }

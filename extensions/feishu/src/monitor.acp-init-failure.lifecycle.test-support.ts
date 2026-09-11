@@ -1,11 +1,13 @@
-import "./lifecycle.test-support.js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createRuntimeEnv } from "../../../test/helpers/plugins/runtime-env.js";
-import type { ClawdbotConfig } from "../runtime-api.js";
+// Preserve module setup before modules that consume it.
+// oxfmt-ignore
 import {
   getFeishuLifecycleTestMocks,
   resetFeishuLifecycleTestMocks,
 } from "./lifecycle.test-support.js";
+import { createRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ClawdbotConfig } from "../runtime-api.js";
+// Feishu plugin module implements monitor.acp init failure.lifecycle support behavior.
 import {
   createFeishuLifecycleFixture,
   createFeishuTextMessageEvent,
@@ -21,16 +23,13 @@ const {
   createEventDispatcherMock,
   dispatchReplyFromConfigMock,
   ensureConfiguredBindingRouteReadyMock,
-  finalizeInboundContextMock,
   resolveAgentRouteMock,
   resolveBoundConversationMock,
   resolveConfiguredBindingRouteMock,
   sendMessageFeishuMock,
   withReplyDispatcherMock,
 } = getFeishuLifecycleTestMocks();
-
-let _handlers: Record<string, (data: unknown) => Promise<void>> = {};
-let lastRuntime: ReturnType<typeof createRuntimeEnv> | null = null;
+let lastRuntime = createRuntimeEnv();
 const originalStateDir = process.env.OPENCLAW_STATE_DIR;
 const { cfg: lifecycleConfig, account: lifecycleAccount } = createFeishuLifecycleFixture({
   accountId: "acct-acp",
@@ -62,9 +61,7 @@ async function setupLifecycleMonitor() {
   lastRuntime = createRuntimeEnv();
   return setupFeishuLifecycleHandler({
     createEventDispatcherMock,
-    onRegister: (registered) => {
-      _handlers = registered;
-    },
+    onRegister: () => {},
     runtime: lastRuntime,
     cfg: lifecycleConfig,
     account: lifecycleAccount,
@@ -77,8 +74,7 @@ describe("Feishu ACP-init failure lifecycle", () => {
   beforeEach(() => {
     vi.useRealTimers();
     resetFeishuLifecycleTestMocks();
-    _handlers = {};
-    lastRuntime = null;
+    lastRuntime = createRuntimeEnv();
     setFeishuLifecycleStateDir("openclaw-feishu-acp-failure");
 
     resolveBoundConversationMock.mockReturnValue(null);
@@ -149,11 +145,8 @@ describe("Feishu ACP-init failure lifecycle", () => {
       queuedFinal: false,
       counts: { final: 0 },
     });
-    withReplyDispatcherMock.mockImplementation(async ({ run }) => await run());
-
     installFeishuLifecycleReplyRuntime({
       resolveAgentRouteMock,
-      finalizeInboundContextMock,
       dispatchReplyFromConfigMock,
       withReplyDispatcherMock,
       storePath: "/tmp/feishu-acp-failure-sessions.json",

@@ -1,9 +1,11 @@
+// Browser tests cover client fetch.attach only plugin behavior.
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { clearConfigCache } from "../../../../src/config/config.js";
+import { clearRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTempHomeEnv } from "../../test-support.js";
+import { stopBrowserControlService } from "../control-service.js";
 import { fetchBrowserJson } from "./client-fetch.js";
 
 type TempHome = {
@@ -14,8 +16,16 @@ type TempHome = {
 describe("browser client fetch attachOnly diagnostics", () => {
   let tempHome: TempHome | undefined;
 
+  beforeEach(async () => {
+    vi.useRealTimers();
+    await stopBrowserControlService();
+    clearRuntimeConfigSnapshot();
+  });
+
   afterEach(async () => {
-    clearConfigCache();
+    vi.useRealTimers();
+    await stopBrowserControlService();
+    clearRuntimeConfigSnapshot();
     await tempHome?.restore();
     tempHome = undefined;
   });
@@ -28,7 +38,9 @@ describe("browser client fetch attachOnly diagnostics", () => {
       socket.on("close", () => sockets.delete(socket));
       socket.on("error", () => {});
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", resolve);
+    });
     const port = (server.address() as { port: number }).port;
     const configPath = path.join(tempHome.home, ".openclaw", "openclaw.json");
     await fs.writeFile(
@@ -43,7 +55,6 @@ describe("browser client fetch attachOnly diagnostics", () => {
               hung: {
                 cdpUrl: `http://127.0.0.1:${port}`,
                 attachOnly: true,
-                color: "#00AA00",
               },
             },
           },
@@ -53,7 +64,7 @@ describe("browser client fetch attachOnly diagnostics", () => {
       ),
     );
     process.env.OPENCLAW_CONFIG_PATH = configPath;
-    clearConfigCache();
+    clearRuntimeConfigSnapshot();
 
     try {
       const thrown = await fetchBrowserJson("/tabs?profile=hung", { timeoutMs: 200 }).catch(
@@ -63,13 +74,17 @@ describe("browser client fetch attachOnly diagnostics", () => {
       const message = thrown instanceof Error ? thrown.message : String(thrown);
       expect(message).toContain("browser profile is external to OpenClaw");
       expect(message).toContain("Restarting the OpenClaw gateway will not launch it");
+      expect(message).toContain("Retry the browser tool once");
+      expect(message).toContain("If the same error persists");
       expect(message).not.toContain("Restart the OpenClaw gateway");
       expect(message).not.toContain("Do NOT retry the browser tool");
     } finally {
       for (const socket of sockets) {
         socket.destroy();
       }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
     }
   });
 });

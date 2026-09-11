@@ -1,14 +1,17 @@
-import { ChannelType, type Client } from "@buape/carbon";
+// Discord plugin module implements thread channel context behavior.
+import { isDiscordThreadChannelType } from "../channel-type.js";
+import type { ChannelType } from "../internal/discord.js";
 import { normalizeDiscordSlug } from "./allow-list.js";
 import {
   resolveDiscordChannelIdSafe,
   resolveDiscordChannelInfoSafe,
   resolveDiscordChannelParentIdSafe,
 } from "./channel-access.js";
-import { resolveDiscordChannelInfo, type DiscordChannelInfo } from "./message-utils.js";
+import { resolveDiscordChannelInfo } from "./message-channel-info.js";
+import type { DiscordChannelInfo, DiscordChannelInfoClient } from "./message-channel-info.js";
 import { resolveDiscordThreadParentInfo } from "./threading.js";
 
-export type DiscordThreadLikeChannelContext = {
+type DiscordThreadLikeChannelContext = {
   channelType?: ChannelType;
   isThreadChannel: boolean;
   channelId: string;
@@ -20,14 +23,6 @@ export type DiscordThreadLikeChannelContext = {
   threadParentSlug: string;
   channelInfo: DiscordChannelInfo | null;
 };
-
-export function isDiscordThreadChannelType(type: ChannelType | number | undefined): boolean {
-  return (
-    type === ChannelType.PublicThread ||
-    type === ChannelType.PrivateThread ||
-    type === ChannelType.AnnouncementThread
-  );
-}
 
 function buildFetchedChannelInfo(channel: unknown): DiscordChannelInfo | null {
   const channelInfo = resolveDiscordChannelInfoSafe(channel);
@@ -44,7 +39,7 @@ function buildFetchedChannelInfo(channel: unknown): DiscordChannelInfo | null {
 }
 
 export async function resolveDiscordThreadLikeChannelContext(params: {
-  client: Client;
+  client: DiscordChannelInfoClient;
   channel: unknown;
   channelIdFallback?: string;
   channelInfo?: DiscordChannelInfo | null;
@@ -97,7 +92,7 @@ export async function resolveDiscordThreadLikeChannelContext(params: {
 }
 
 export async function resolveFetchedDiscordThreadLikeChannelContext(params: {
-  client: Client;
+  client: DiscordChannelInfoClient;
   channel: unknown;
   channelIdFallback?: string;
 }): Promise<DiscordThreadLikeChannelContext> {

@@ -1,6 +1,8 @@
-import { PluginLruCache } from "./plugin-lru-cache.js";
+/** Cache state helper for plugin loader registries, in-flight loads, and warning suppression. */
+import { PluginLruCache } from "./plugin-cache-primitives.js";
 
-export class PluginLoadReentryError extends Error {
+/** Error thrown when one plugin registry cache key attempts nested loading. */
+class PluginLoadReentryError extends Error {
   readonly cacheKey: string;
 
   constructor(cacheKey: string) {
@@ -10,26 +12,25 @@ export class PluginLoadReentryError extends Error {
   }
 }
 
+/** Small registry cache with reentry detection and per-key warning memory. */
 export class PluginLoaderCacheState<T> {
   readonly #registryCache: PluginLruCache<T>;
   readonly #inFlightLoads = new Set<string>();
-  readonly #openAllowlistWarningCache = new Set<string>();
+  readonly #openAllowlistWarningCache: PluginLruCache<true>;
 
   constructor(defaultMaxEntries: number) {
     this.#registryCache = new PluginLruCache<T>(defaultMaxEntries);
-  }
-
-  get maxEntries(): number {
-    return this.#registryCache.maxEntries;
-  }
-
-  setMaxEntriesForTest(value?: number): void {
-    this.#registryCache.setMaxEntriesForTest(value);
+    this.#openAllowlistWarningCache = new PluginLruCache<true>(defaultMaxEntries);
   }
 
   clear(): void {
     this.#registryCache.clear();
     this.#inFlightLoads.clear();
+    this.#openAllowlistWarningCache.clear();
+  }
+
+  clearCachedRegistries(): void {
+    this.#registryCache.clear();
     this.#openAllowlistWarningCache.clear();
   }
 
@@ -39,6 +40,10 @@ export class PluginLoaderCacheState<T> {
 
   set(cacheKey: string, state: T): void {
     this.#registryCache.set(cacheKey, state);
+  }
+
+  deleteValue(state: T): void {
+    this.#registryCache.deleteValue(state);
   }
 
   isLoadInFlight(cacheKey: string): boolean {
@@ -57,10 +62,10 @@ export class PluginLoaderCacheState<T> {
   }
 
   hasOpenAllowlistWarning(cacheKey: string): boolean {
-    return this.#openAllowlistWarningCache.has(cacheKey);
+    return this.#openAllowlistWarningCache.get(cacheKey) === true;
   }
 
   recordOpenAllowlistWarning(cacheKey: string): void {
-    this.#openAllowlistWarningCache.add(cacheKey);
+    this.#openAllowlistWarningCache.set(cacheKey, true);
   }
 }

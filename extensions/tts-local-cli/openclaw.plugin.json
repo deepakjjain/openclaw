@@ -1,5 +1,10 @@
 {
   "id": "tts-local-cli",
+  "categories": ["voice"],
+  "capabilityCatalogEntry": "./capability-catalog.ts",
+  "activation": {
+    "onStartup": false
+  },
   "enabledByDefault": true,
   "contracts": {
     "speechProviders": ["tts-local-cli", "cli"]
